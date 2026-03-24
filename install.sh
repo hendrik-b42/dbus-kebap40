@@ -2,7 +2,12 @@
 # =============================================================================
 # Installationsskript: KEBA P40 Venus OS Treiber
 # =============================================================================
-# Ausfuehren auf dem Venus OS Raspberry Pi als root:
+#
+# Installation direkt aus GitHub:
+#   git clone https://github.com/hendrik-b42/dbus-kebap40.git /data/dbus-keba-p40
+#   bash /data/dbus-keba-p40/install.sh
+#
+# Oder von einem beliebigen Verzeichnis:
 #   chmod +x install.sh && ./install.sh
 #
 # Voraussetzungen:
@@ -19,6 +24,7 @@ INSTALL_DIR="/data/dbus-keba-p40"
 SERVICE_DIR="/opt/victronenergy/service/dbus-keba-p40"
 LOG_DIR="/var/log/dbus-keba-p40"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GITHUB_REPO="https://github.com/hendrik-b42/dbus-kebap40.git"
 
 echo "=== KEBA P40 Venus OS Treiber Installation ==="
 echo ""
@@ -30,23 +36,28 @@ if [ ! -d "/opt/victronenergy" ]; then
     exit 1
 fi
 
+# --- git sicherstellen (wird fuer velib_python und ggf. Clone benoetigt) ---
+ensure_git() {
+    if command -v git &> /dev/null; then
+        return 0
+    fi
+    echo "   git nicht gefunden, installiere git via opkg..."
+    if command -v opkg &> /dev/null; then
+        opkg update && opkg install git
+    else
+        echo "FEHLER: git nicht gefunden und opkg nicht verfuegbar."
+        echo "        Bitte git manuell installieren."
+        exit 1
+    fi
+}
+
 # 0. velib_python herunterladen falls nicht vorhanden
 EXT_DIR="${INSTALL_DIR}/ext/velib_python"
 if [ ! -d "${EXT_DIR}" ]; then
     echo "[0/6] Lade velib_python herunter..."
     mkdir -p "${INSTALL_DIR}/ext"
-    if command -v git &> /dev/null; then
-        git clone --depth 1 https://github.com/victronenergy/velib_python.git "${EXT_DIR}"
-    elif command -v opkg &> /dev/null; then
-        echo "   git nicht gefunden, installiere git via opkg..."
-        opkg update && opkg install git
-        git clone --depth 1 https://github.com/victronenergy/velib_python.git "${EXT_DIR}"
-    else
-        echo "FEHLER: git nicht gefunden und opkg nicht verfuegbar."
-        echo "        Bitte manuell installieren:"
-        echo "        git clone https://github.com/victronenergy/velib_python.git ${EXT_DIR}"
-        exit 1
-    fi
+    ensure_git
+    git clone --depth 1 https://github.com/victronenergy/velib_python.git "${EXT_DIR}"
 else
     echo "[0/6] velib_python bereits vorhanden, uebersprungen."
 fi
@@ -59,20 +70,19 @@ if [ "${SCRIPT_DIR}" != "${INSTALL_DIR}" ]; then
     cp "${SCRIPT_DIR}/dbus-keba-p40.py" "${INSTALL_DIR}/"
     cp "${SCRIPT_DIR}/log/run" "${INSTALL_DIR}/log/"
     cp "${SCRIPT_DIR}/run" "${INSTALL_DIR}/"
-
-    # Config-Template immer kopieren
     cp "${SCRIPT_DIR}/config.ini.example" "${INSTALL_DIR}/"
-
-    # Config nur aus Template erstellen wenn noch nicht vorhanden
-    if [ ! -f "${INSTALL_DIR}/config.ini" ]; then
-        cp "${SCRIPT_DIR}/config.ini.example" "${INSTALL_DIR}/config.ini"
-        echo "   WICHTIG: Bitte ${INSTALL_DIR}/config.ini anpassen!"
-        echo "   Mindestens [Keba] host = <IP-Adresse der Wallbox>"
-    else
-        echo "   config.ini existiert bereits, wird nicht ueberschrieben."
-    fi
+    echo "   Dateien kopiert."
 else
     echo "   Dateien liegen bereits in ${INSTALL_DIR}, Kopieren uebersprungen."
+fi
+
+# Config aus Template erstellen wenn noch nicht vorhanden
+if [ ! -f "${INSTALL_DIR}/config.ini" ]; then
+    cp "${INSTALL_DIR}/config.ini.example" "${INSTALL_DIR}/config.ini"
+    echo "   WICHTIG: Bitte ${INSTALL_DIR}/config.ini anpassen!"
+    echo "   Mindestens [Keba] host = <IP-Adresse der Wallbox>"
+else
+    echo "   config.ini existiert bereits, wird nicht ueberschrieben."
 fi
 
 # 2. Ausfuehrbar machen
@@ -87,7 +97,6 @@ mkdir -p "${LOG_DIR}"
 
 # 4. Service-Symlink erstellen
 echo "[4/6] Erstelle Service-Symlink..."
-# Entferne alten Symlink falls vorhanden
 rm -f "${SERVICE_DIR}"
 ln -s "${INSTALL_DIR}" "${SERVICE_DIR}"
 echo "   ${SERVICE_DIR} -> ${INSTALL_DIR}"
@@ -130,3 +139,6 @@ echo "     Service stoppen:  svc -d ${SERVICE_DIR}"
 echo "     Logs ansehen:     tail -f ${LOG_DIR}/current | tai64nlocal"
 echo ""
 echo "  4. Oder einfach: reboot"
+echo ""
+echo "Update vom GitHub:"
+echo "  cd ${INSTALL_DIR} && git pull && bash install.sh"

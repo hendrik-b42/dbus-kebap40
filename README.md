@@ -22,27 +22,46 @@ Venus OS D-Bus-Treiber für die **KEBA KeContact P40** Wallbox. Kommuniziert üb
 
 ## Installation
 
-```bash
-# Dateien auf den Venus OS Raspberry Pi kopieren (z.B. via SCP)
-scp -r . root@<venus-ip>:/tmp/dbus-keba-p40/
+### Direkt auf dem Venus OS (empfohlen)
 
-# Auf dem Venus OS:
-cd /tmp/dbus-keba-p40
-chmod +x install.sh
-./install.sh
+Per SSH auf dem Venus OS Raspberry Pi als root:
+
+```bash
+# 1. Falls git noch nicht installiert ist:
+opkg update && opkg install git
+
+# 2. Repo direkt nach /data klonen:
+git clone https://github.com/hendrik-b42/dbus-kebap40.git /data/dbus-keba-p40
+
+# 3. Installieren:
+bash /data/dbus-keba-p40/install.sh
 ```
 
-Das Installationsskript:
-1. Klont [velib_python](https://github.com/victronenergy/velib_python) nach `ext/velib_python/` (wird für die D-Bus-Kommunikation benötigt). Falls `git` nicht vorhanden ist, wird es automatisch via `opkg` installiert.
-2. Kopiert Dateien nach `/data/dbus-keba-p40/` (überlebt Firmware-Updates)
-3. Erstellt den daemontools-Service unter `/opt/victronenergy/service/`
-4. Richtet Autostart via `/data/rc.local` ein
+### Alternativ: Dateien manuell kopieren
 
-> **Hinweis:** Falls git auf dem Venus OS nicht verfügbar ist und `opkg` nicht funktioniert, kann velib_python auch manuell heruntergeladen werden:
-> ```bash
-> mkdir -p /data/dbus-keba-p40/ext
-> git clone --depth 1 https://github.com/victronenergy/velib_python.git /data/dbus-keba-p40/ext/velib_python
-> ```
+```bash
+# Von einem anderen Rechner per SCP:
+scp -r . root@<venus-ip>:/tmp/dbus-keba-p40/
+
+# Dann auf dem Venus OS:
+cd /tmp/dbus-keba-p40
+bash install.sh
+```
+
+### Was das Installskript macht
+
+1. Installiert `git` via `opkg` falls nicht vorhanden
+2. Klont [velib_python](https://github.com/victronenergy/velib_python) nach `ext/velib_python/` (wird für die D-Bus-Kommunikation benötigt)
+3. Kopiert Dateien nach `/data/dbus-keba-p40/` (überlebt Firmware-Updates)
+4. Erstellt `config.ini` aus dem Template (falls nicht vorhanden)
+5. Erstellt den daemontools-Service unter `/opt/victronenergy/service/`
+6. Richtet Autostart via `/data/rc.local` ein
+
+### Update
+
+```bash
+cd /data/dbus-keba-p40 && git pull && bash install.sh
+```
 
 ## Konfiguration
 
