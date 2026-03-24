@@ -1,0 +1,13 @@
+# Konfiguration (enthält lokale IP-Adressen)
+config.ini
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# velib_python (wird bei Installation geklont)
+ext/
+
+# Logs
+*.log

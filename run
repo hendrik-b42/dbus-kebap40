@@ -1,0 +1,7 @@
+#!/bin/sh
+# Venus OS daemontools run script for dbus-keba-p40
+# Placed in /opt/victronenergy/service/dbus-keba-p40/run
+# See: https://github.com/victronenergy/venus/wiki/howto-add-a-driver-to-Venus
+
+exec 2>&1
+exec /usr/bin/python3 /data/dbus-keba-p40/dbus-keba-p40.py

@@ -1,0 +1,110 @@
+# =============================================================================
+# KEBA P40 Venus OS Treiber - Konfiguration
+# =============================================================================
+# Anpassen und als config.ini speichern.
+
+[General]
+# Log-Level: DEBUG, INFO, WARNING, ERROR
+log_level = INFO
+
+# DRY-RUN MODUS (empfohlen fuer den ersten Test!)
+# Bei true: liest alle Keba-Daten und berechnet den Sollstrom,
+# schreibt aber NICHTS zur Wallbox. So kannst du im Log sehen,
+# was der Treiber tun WUERDE, ohne dass etwas passiert.
+# Auf false setzen, wenn alles passt.
+dry_run = true
+
+[Keba]
+# IP-Adresse der Keba P40 Wallbox (MUSS angepasst werden!)
+host = 192.168.1.100
+
+# Modbus TCP Port (Standard: 502, lt. Handbuch S.8)
+port = 502
+
+# Verbindungs-Timeout in Sekunden
+timeout = 5.0
+
+[Venus]
+# Eindeutige Device-Instance fuer Venus OS D-Bus
+# Muss einzigartig unter allen evcharger-Diensten sein
+device_instance = 40
+
+[Charging]
+# --- PV-Ueberschussladung ---
+
+# Minimaler Ladestrom in mA (lt. Handbuch Register 5004: 6000-32000)
+# Unter diesem Wert wird die Ladung pausiert (Register 5004 = 0)
+min_current_ma = 6000
+
+# Puffer in Watt: Wieviel Leistung soll NICHT ins Auto gehen,
+# um Netzbezug zu vermeiden (z.B. fuer Hausverbrauch-Schwankungen)
+surplus_buffer_w = 200
+
+# Schrittweite fuer sanftes Hoch-/Runterregeln in mA
+ramp_step_ma = 1000
+
+# Update-Intervall in Sekunden (min. 0.5s lt. Handbuch fuer Lesen)
+update_interval_s = 2.0
+
+# --- Phasenumschaltung ---
+# HINWEIS: Register 5050/5052 benoetigen ggf. ein Firmware-Update!
+# (lt. Handbuch Section 4.5/4.6: "Function will be made available
+#  with a later software update")
+phase_switching = true
+
+# --- EMS Failsafe (Handbuch Section 4.7, S.22-23) ---
+# Verhalten bei Verbindungsverlust zum Raspberry Pi:
+
+# Failsafe-Strom in mA (0 = Ladung stoppen, 6000-32000 = weiter laden)
+failsafe_current_ma = 0
+
+# Failsafe-Timeout in Sekunden (0 = deaktiviert, 5-600)
+# Nach dieser Zeit ohne Modbus-Kommando greift der Failsafe-Strom
+failsafe_timeout_s = 30
+
+[Battery]
+# ==========================================================================
+# Batterie-Prioritaet: Wer bekommt den PV-Ueberschuss zuerst?
+# ==========================================================================
+#
+# Venus OS ESS regelt normalerweise selbst, wieviel PV-Strom in die
+# Batterie geht. Der Grid-Meter-Wert (/Ac/Grid/Power) zeigt nur, was
+# NACH der Batterie-Ladung uebrig ist. Dieser Treiber kann zusaetzlich
+# die Batterie-Ladeleistung "umleiten", indem er sie als verfuegbaren
+# Ueberschuss fuer das Auto betrachtet.
+#
+# Drei Strategien stehen zur Verfuegung:
+#
+# "grid_only" (konservativ):
+#   Nur was wirklich ins Netz eingespeist wird, geht ins Auto.
+#   Die Batterie wird vom ESS-System ganz normal geladen.
+#   -> Batterie hat IMMER Vorrang.
+#   -> Gut wenn die Batterie klein ist und du sie fuer den Abend brauchst.
+#
+# "battery_above_soc" (empfohlen):
+#   Unter dem SOC-Schwellwert (soc_threshold) hat die Batterie Vorrang.
+#   Ueber dem Schwellwert wird die Batterie-Ladeleistung auch fuer
+#   das Auto freigegeben.
+#   -> Batterie bis z.B. 80% laden, dann Auto.
+#   -> Bester Kompromiss: Batterie hat genug Reserve fuer den Abend,
+#      und das Auto bekommt trotzdem genuegend PV-Strom.
+#
+# "ev_first" (aggressiv):
+#   Die Batterie-Ladeleistung wird immer als verfuegbar betrachtet.
+#   -> Auto hat IMMER Vorrang vor der Batterie.
+#   -> Sinnvoll wenn das Auto viel Strom braucht und die Batterie
+#      weniger wichtig ist.
+#
+strategy = battery_above_soc
+
+# Ab welchem Batterie-SOC (%) darf der Ueberschuss ans Auto gehen?
+# Nur relevant bei Strategie "battery_above_soc".
+# Beispiel: 80 = Batterie wird zuerst auf 80% geladen, danach geht
+# der PV-Ueberschuss (inkl. Batterie-Ladeleistung) ins Auto.
+soc_threshold = 80
+
+# Unter diesem SOC (%) wird die EV-Ladung IMMER pausiert,
+# egal welche Strategie aktiv ist (Batterie-Schutz).
+# Relevant wenn die Batterie sich abends entlaedt und das Auto
+# noch haengt - dann soll die Batterie nicht leer gesaugt werden.
+min_soc = 20

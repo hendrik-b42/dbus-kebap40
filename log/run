@@ -1,0 +1,6 @@
+#!/bin/sh
+# Venus OS daemontools log script for dbus-keba-p40
+# See: https://github.com/victronenergy/venus/wiki/howto-add-a-driver-to-Venus
+# Uses multilog (daemontools) - svlogd is not available on all Venus OS builds
+
+exec multilog t /var/log/dbus-keba-p40
