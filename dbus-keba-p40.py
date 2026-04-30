@@ -735,7 +735,9 @@ class KebaP40Service:
         success = self.modbus.write_register(REG_SET_CURRENT, int(current_ma))
         if success:
             self._last_current_write = current_ma
-            log.debug(f"Ladestrom gesetzt: {current_ma} mA")
+            log.info(f">>> Register 5004 = {current_ma} mA geschrieben")
+        else:
+            log.error(f">>> Register 5004 Schreibfehler! Sollwert war {current_ma} mA")
         return success
 
     def _setup_failsafe(self):
@@ -1131,8 +1133,22 @@ class KebaP40Service:
                     self._write_charging_current(0)
                 return True
 
-            # Only adjust current when car is connected and ready/charging
-            if keba_state not in (2, 3):
+            # Log state on every cycle at INFO level for diagnostics
+            cable_state = self._keba_data.get("cable_state", 0)
+            state_names = {0: "Start-up", 1: "Nicht bereit", 2: "Bereit",
+                           3: "Laedt", 4: "Fehler", 5: "Unterbrochen"}
+            mode_names = {0: "Manuell", 1: "Auto (PV)", 2: "Geplant"}
+            log.info(f"Status: Keba={keba_state}({state_names.get(keba_state, '?')}), "
+                     f"Kabel={cable_state}, Modus={mode_names.get(self._mode, '?')}, "
+                     f"Soll={self._set_current_ma}mA, StartStop={self._start_stop}")
+
+            # Determine if we should send current to Keba
+            # State 2 = ready (waiting for EV), State 3 = charging
+            # Also allow state 1 (not ready) to send current, because
+            # a previous "suspend" (Register 5004=0) may have caused state 1.
+            # Sending a valid current (6000-32000) can wake the Keba back up.
+            if keba_state not in (1, 2, 3):
+                log.info(f"Keba State {keba_state} - kein Ladebefehl moeglich")
                 return True
 
             if self._mode == self.MODE_AUTO:
@@ -1159,11 +1175,15 @@ class KebaP40Service:
                     self._set_current_ma = target_ma
 
                     # Write to Keba (respects 5s write interval internally)
+                    log.info(f"PV-Modus: Grid={avg_grid:.0f}W -> Soll={target_ma}mA")
                     self._write_charging_current(target_ma)
+                else:
+                    log.warning("Grid-Meter nicht lesbar, kein Ladebefehl")
 
             elif self._mode == self.MODE_MANUAL:
                 # --- Manual Mode ---
                 # Use the SetCurrent value directly
+                log.info(f"Manuell: Sende {self._set_current_ma}mA an Keba")
                 self._write_charging_current(self._set_current_ma)
 
         except Exception as e:
