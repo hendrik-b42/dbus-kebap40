@@ -975,6 +975,12 @@ class KebaP40Service:
         if target_ma == 0 and current_ma > 0:
             return 0  # Immediate stop when target is 0
 
+        # Starting up from below min_current_ma: jump directly to min,
+        # because anything in (0, min) gets clamped to 0 in
+        # _write_charging_current and would suspend the wallbox.
+        if current_ma < self.min_current_ma and target_ma >= self.min_current_ma:
+            return min(target_ma, self.min_current_ma + self.ramp_step_ma)
+
         diff = target_ma - current_ma
         if abs(diff) <= self.ramp_step_ma:
             return target_ma
@@ -1144,10 +1150,10 @@ class KebaP40Service:
 
             # Determine if we should send current to Keba
             # State 2 = ready (waiting for EV), State 3 = charging
-            # Also allow state 1 (not ready) to send current, because
-            # a previous "suspend" (Register 5004=0) may have caused state 1.
-            # Sending a valid current (6000-32000) can wake the Keba back up.
-            if keba_state not in (1, 2, 3):
+            # State 1 (not ready) and State 5 (suspended) are also reachable
+            # via a previous Register 5004=0 (suspend); writing a valid
+            # current (>= min_current_ma) wakes the Keba back up.
+            if keba_state not in (1, 2, 3, 5):
                 log.info(f"Keba State {keba_state} - kein Ladebefehl moeglich")
                 return True
 
