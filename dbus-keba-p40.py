@@ -445,6 +445,7 @@ class KebaP40Service:
         self._position = 1           # 1 = AC Output (after inverter)
         self._current_phases = 3     # Current phase count (1 or 3)
         self._charging_start_time = 0
+        self._charging_total_seconds = 0  # Cumulative charge time across pauses in same session
         self._last_current_write = 0
         self._surplus_history = []   # Rolling average of surplus
 
@@ -499,7 +500,7 @@ class KebaP40Service:
         self._dbusservice.add_path("/Ac/L1/Power", 0, gettextcallback=lambda p, v: f"{v:.0f}W")
         self._dbusservice.add_path("/Ac/L2/Power", 0, gettextcallback=lambda p, v: f"{v:.0f}W")
         self._dbusservice.add_path("/Ac/L3/Power", 0, gettextcallback=lambda p, v: f"{v:.0f}W")
-        self._dbusservice.add_path("/Ac/Energy/Forward", 0, gettextcallback=lambda p, v: f"{v:.2f}kWh")
+        self._dbusservice.add_path("/Ac/Energy/Forward", 0.0, gettextcallback=lambda p, v: f"{v:.2f}kWh")
 
         # Current
         self._dbusservice.add_path("/Current", 0, gettextcallback=lambda p, v: f"{v:.1f}A")
@@ -536,6 +537,8 @@ class KebaP40Service:
         # Status
         self._dbusservice.add_path("/Status", 0)
         self._dbusservice.add_path("/ChargingTime", 0, gettextcallback=lambda p, v: f"{v}s")
+        # Total energy delivered by the wallbox over its lifetime (kWh)
+        self._dbusservice.add_path("/Ac/Energy/Lifetime", 0.0, gettextcallback=lambda p, v: f"{v:.2f}kWh")
         self._dbusservice.add_path("/Model", "KeContact P40")
 
         # Position: 0 = AC Input (grid side), 1 = AC Output (inverter side)
@@ -1020,10 +1023,14 @@ class KebaP40Service:
         self._dbusservice["/Ac/L2/Power"] = round(v2 * i2, 1) if v2 and i2 else 0
         self._dbusservice["/Ac/L3/Power"] = round(v3 * i3, 1) if v3 and i3 else 0
 
-        # Total energy (Register 1036, Unit: 0.1 Wh -> kWh)
+        # Energy values (Keba unit: 0.1 Wh -> kWh)
         # Known bug: FW < 1.2.1 reports in Wh instead of 0.1 Wh (Guide p.24)
         total_energy_kwh = d.get("total_energy", 0) * 0.1 / 1000.0
-        self._dbusservice["/Ac/Energy/Forward"] = round(total_energy_kwh, 2)
+        session_energy_kwh = d.get("session_energy", 0) * 0.1 / 1000.0
+        # /Ac/Energy/Forward shows session energy (typical Venus EV-charger UI).
+        # /Ac/Energy/Lifetime keeps the lifetime total.
+        self._dbusservice["/Ac/Energy/Forward"] = round(session_energy_kwh, 2)
+        self._dbusservice["/Ac/Energy/Lifetime"] = round(total_energy_kwh, 2)
 
         # Current (use max of 3 phases as representative)
         max_current_a = max(i1, i2, i3)
@@ -1040,16 +1047,31 @@ class KebaP40Service:
 
         self._dbusservice["/Status"] = venus_status
 
-        # Charging time tracking
-        if keba_state == 3 and self._charging_start_time == 0:
-            self._charging_start_time = time.monotonic()
-        elif keba_state != 3:
-            self._charging_start_time = 0
+        # Charging time tracking — base session boundary on cable, not state.
+        # cable_state >= 3 means cable plugged into the vehicle. Brief
+        # state transitions (3 -> 2 -> 3) during current changes only pause
+        # the timer; they don't reset the accumulated session time.
+        cable_state = d.get("cable_state", 0)
+        ev_connected = cable_state >= 3
+        now = time.monotonic()
 
-        if self._charging_start_time > 0:
-            self._dbusservice["/ChargingTime"] = int(time.monotonic() - self._charging_start_time)
+        if not ev_connected:
+            # Session ended: reset
+            self._charging_start_time = 0
+            self._charging_total_seconds = 0
+        elif keba_state == 3:
+            if self._charging_start_time == 0:
+                self._charging_start_time = now
         else:
-            self._dbusservice["/ChargingTime"] = 0
+            # EV connected but not actively charging: bank elapsed time
+            if self._charging_start_time > 0:
+                self._charging_total_seconds += now - self._charging_start_time
+                self._charging_start_time = 0
+
+        total = self._charging_total_seconds
+        if self._charging_start_time > 0:
+            total += now - self._charging_start_time
+        self._dbusservice["/ChargingTime"] = int(total)
 
         # MaxCurrent from hardware (Guide Section 3.5.2)
         hw_max = d.get("max_supported_ma", 32000)
