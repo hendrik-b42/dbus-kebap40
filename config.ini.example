@@ -108,3 +108,46 @@ soc_threshold = 80
 # Relevant wenn die Batterie sich abends entlaedt und das Auto
 # noch haengt - dann soll die Batterie nicht leer gesaugt werden.
 min_soc = 20
+
+[ChargeMode]
+# ==========================================================================
+# Dicker Schalter: Normal-Laden vs. PV-Ueberschuss-Laden
+# ==========================================================================
+#
+# Live umschaltbar via D-Bus-Pfad /ChargeMode (Venus GUI / MQTT).
+# Der hier eingetragene Wert ist der STARTWERT nach Treiber-Neustart;
+# bei jeder Aenderung ueber D-Bus wird er hier automatisch persistiert.
+#
+# 0 = Normal-Laden (immer 3-phasig, normal_current_ma, PV egal)
+# 1 = PV-Ueberschuss-Laden (smart, mit Batterie-Verlaengerung ab battery_extend_soc)
+default = 1
+
+# Normal-Modus Ladestrom in mA pro Phase (3-phasig fest).
+# 16000 mA * 3 Phasen * 230 V ~= 11 kW
+normal_current_ma = 16000
+
+# Ab welchem Hausakku-SOC darf im PV-Modus zusaetzlich 1-phasig
+# 6A (~1,4 kW) aus dem Akku ins Auto gezogen werden, auch wenn
+# der reine PV-Ueberschuss nicht reicht?
+battery_extend_soc = 80
+
+# Hysterese fuer den Batterie-Extend (vermeidet Flattern).
+# Aktivieren bei SOC >= battery_extend_soc,
+# deaktivieren erst wieder bei SOC < (battery_extend_soc - extend_hysteresis_soc).
+extend_hysteresis_soc = 3
+
+# Mindestdauer (Sekunden), die ein Modus / eine Phasenanzahl stehen
+# muss, bevor wieder umgeschaltet werden darf. Verhindert Flapping.
+mode_min_hold_s = 60
+
+# Tageszeit-Reserve fuer den Hausakku - er soll bis Sonnenaufgang reichen.
+# Format: HH:MM-HH:MM=PROZENT, mit Komma getrennt.
+# Bereiche duerfen ueber Mitternacht gehen (z.B. 22:00-02:00).
+# Solange der Akku unter dieser Reserve ist, wird er NICHT ins Auto entladen
+# (battery_above_soc-Strategie wird ignoriert, kein Batterie-Extend).
+# Default-Kurve fuer mittelgrosse Hausbatterie (10-20 kWh):
+reserve_schedule = 06:00-17:00=20, 17:00-22:00=30, 22:00-02:00=40, 02:00-06:00=50
+
+# Fallback-Reserve (%), falls reserve_schedule eine Luecke hat
+# oder ein Eintrag nicht parsebar ist.
+reserve_fallback = 40

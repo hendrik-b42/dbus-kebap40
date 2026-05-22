@@ -432,6 +432,25 @@ class KebaP40Service:
         self.battery_soc_threshold = config.getint("Battery", "soc_threshold", fallback=80)
         self.battery_min_soc = config.getint("Battery", "min_soc", fallback=20)
 
+        # ChargeMode (dicker Schalter): 0 = Normal 11 kW 3-phasig, 1 = PV-Ueberschuss
+        self.charge_mode = config.getint("ChargeMode", "default", fallback=1)
+        self.normal_current_ma = config.getint("ChargeMode", "normal_current_ma", fallback=16000)
+        self.battery_extend_soc = config.getint("ChargeMode", "battery_extend_soc", fallback=80)
+        self.extend_hysteresis_soc = config.getint("ChargeMode", "extend_hysteresis_soc", fallback=3)
+        self.mode_min_hold_s = config.getint("ChargeMode", "mode_min_hold_s", fallback=60)
+        self.reserve_schedule_raw = config.get(
+            "ChargeMode", "reserve_schedule",
+            fallback="06:00-17:00=20,17:00-22:00=30,22:00-02:00=40,02:00-06:00=50",
+        )
+        self.reserve_fallback = config.getint("ChargeMode", "reserve_fallback", fallback=40)
+        self._reserve_schedule = self._parse_reserve_schedule(self.reserve_schedule_raw)
+        if self.battery_extend_soc <= self.battery_min_soc:
+            log.warning(
+                f"Konfig: battery_extend_soc ({self.battery_extend_soc}%) <= "
+                f"min_soc ({self.battery_min_soc}%) - Batterie-Extend waere quasi "
+                f"immer aktiv. Bitte korrigieren."
+            )
+
         # Dry-Run Modus: liest Daten, berechnet alles, aber schreibt NICHTS
         self.dry_run = config.getboolean("General", "dry_run", fallback=False)
         if self.dry_run:
@@ -448,6 +467,10 @@ class KebaP40Service:
         self._charging_total_seconds = 0  # Cumulative charge time across pauses in same session
         self._last_current_write = 0
         self._surplus_history = []   # Rolling average of surplus
+        # Batterie-Extend (PV-Modus) und Phasen-Hold-Down
+        self._extend_active = False
+        self._extend_last_change = 0.0
+        self._phase_last_change = 0.0
 
         # Keba live data cache
         self._keba_data = {}
@@ -534,6 +557,14 @@ class KebaP40Service:
             onchangecallback=self._on_auto_start_changed,
         )
 
+        # ChargeMode: dicker Schalter Normal-Laden (0) vs. PV-Ueberschuss (1)
+        # Initialwert kommt aus config.ini [ChargeMode] default
+        self._dbusservice.add_path(
+            "/ChargeMode", self.charge_mode,
+            writeable=True,
+            onchangecallback=self._on_charge_mode_changed,
+        )
+
         # Status
         self._dbusservice.add_path("/Status", 0)
         self._dbusservice.add_path("/ChargingTime", 0, gettextcallback=lambda p, v: f"{v}s")
@@ -588,6 +619,63 @@ class KebaP40Service:
 
     def _on_auto_start_changed(self, path, value):
         return True
+
+    def _on_charge_mode_changed(self, path, value):
+        """
+        Handle /ChargeMode change from Venus OS.
+
+        0 = Normal-Laden (immer 3-phasig, normal_current_ma, PV egal)
+        1 = PV-Ueberschuss-Laden (smart, mit Batterie-Extend ab battery_extend_soc)
+        """
+        if value is None:
+            return True
+        try:
+            new_mode = int(value)
+        except (TypeError, ValueError):
+            log.warning(f"Ungueltiger ChargeMode-Wert ignoriert: {value!r}")
+            return False
+        if new_mode not in (0, 1):
+            log.warning(f"Ungueltiger ChargeMode {new_mode} (erlaubt: 0, 1) - ignoriert")
+            return False
+        if new_mode == self.charge_mode:
+            return True
+        old_mode = self.charge_mode
+        self.charge_mode = new_mode
+        # State sauber zuruecksetzen, damit der naechste Zyklus frisch entscheidet
+        self._extend_active = False
+        self._extend_last_change = time.monotonic()
+        self._surplus_history.clear()
+        # Sofort-Phasenwechsel zulassen (Hold-Down ueberspringen)
+        self._phase_last_change = 0.0
+        mode_names = {0: "Normal 11kW 3-phasig", 1: "PV-Ueberschuss"}
+        log.info(f"ChargeMode geaendert: {mode_names[old_mode]} -> {mode_names[new_mode]}")
+        self._persist_charge_mode(new_mode)
+        return True
+
+    def _persist_charge_mode(self, value):
+        """
+        Speichert den ChargeMode in config.ini, damit er einen Neustart ueberlebt.
+
+        Hinweis: configparser.write() verliert Kommentare in der Datei. Die
+        kommentierte Vorlage lebt in config.ini.example.
+        """
+        try:
+            config_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "config.ini"
+            )
+            cp = configparser.ConfigParser()
+            cp.optionxform = str  # Keys nicht in lowercase wandeln
+            cp.read(config_path)
+            if not cp.has_section("ChargeMode"):
+                cp.add_section("ChargeMode")
+            cp.set("ChargeMode", "default", str(value))
+            tmp_path = config_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                cp.write(f)
+            os.replace(tmp_path, config_path)
+            log.info(f"ChargeMode={value} in config.ini gespeichert")
+        except Exception as e:
+            log.warning(f"Konnte ChargeMode nicht persistieren: {e}")
 
     # --- Venus OS D-Bus Readings (Grid, Battery, PV) ---
 
@@ -796,140 +884,192 @@ class KebaP40Service:
 
     # --- PV Surplus Charging Logic ---
 
+    def _parse_reserve_schedule(self, raw):
+        """
+        Parst eine Tageszeit-Reserve-Kurve.
+
+        Format: 'HH:MM-HH:MM=PROZENT, ...'
+        Bereiche, die ueber Mitternacht gehen (start > end), werden in
+        zwei Tupel aufgespalten, damit der Lookup einfach bleibt.
+        Liefert eine Liste von Tuples (start_minute, end_minute, percent).
+        """
+        result = []
+        if not raw:
+            return result
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                time_part, pct_part = entry.split("=")
+                start_s, end_s = time_part.split("-")
+                sh, sm = (int(x) for x in start_s.strip().split(":"))
+                eh, em = (int(x) for x in end_s.strip().split(":"))
+                start = sh * 60 + sm
+                end = eh * 60 + em
+                pct = int(pct_part.strip())
+                if start == end:
+                    continue
+                if start < end:
+                    result.append((start, end, pct))
+                else:
+                    # ueber Mitternacht
+                    result.append((start, 24 * 60, pct))
+                    result.append((0, end, pct))
+            except Exception as e:
+                log.warning(f"Reserve-Schedule Eintrag ungueltig: '{entry}' ({e})")
+        return result
+
+    def _get_battery_reserve_soc(self, now=None):
+        """
+        Aktuelle Soll-Reserve in % gemaess Tageszeit-Kurve.
+
+        Bei Loch in der Konfig oder Parse-Fehler: self.reserve_fallback.
+        """
+        if now is None:
+            now = time.localtime()
+        minute_of_day = now.tm_hour * 60 + now.tm_min
+        for start, end, pct in self._reserve_schedule:
+            if start <= minute_of_day < end:
+                return pct
+        return self.reserve_fallback
+
     def _calculate_surplus_current(self, grid_power_w):
         """
-        Calculate the target charging current based on PV surplus
-        and battery priority strategy.
+        Berechnet im PV-Modus (/ChargeMode = 1) den Ziel-Ladestrom, die
+        Ziel-Phasenanzahl und die Quelle (PV / Batterie).
 
-        Strategies (configurable in [Battery] section of config.ini):
+        Entscheidungsbaum:
+          SOC < battery_min_soc           -> 0 (Schutz, EV-Ladung pausiert)
+          SOC < Reserve_TOD               -> nur PV-Ueberschuss (Strategie ignoriert)
+          SOC < battery_extend_soc        -> bestehende Strategie
+          SOC >= battery_extend_soc       -> Strategie + Batterie-Extend:
+                                              falls Ueberschuss < 1-Phase-Minimum,
+                                              dann 1-phasig 6A aus Akku.
 
-        1. "grid_only" (konservativ):
-           Nur echter Netz-Ueberschuss geht ins Auto. Die Batterie wird
-           vom ESS-System vollstaendig normal geladen/entladen. Das EV
-           bekommt nur, was sonst ins Netz eingespeist wuerde.
-           -> Batterie hat immer Vorrang.
-
-        2. "battery_above_soc" (empfohlen):
-           Unter dem SOC-Schwellwert hat die Batterie Vorrang (wie grid_only).
-           Ueber dem Schwellwert wird die Leistung, die der ESS in die
-           Batterie stecken wuerde, als zusaetzlicher Ueberschuss fuer
-           das EV betrachtet.
-           -> Batterie bis X% laden, dann Auto.
-
-        3. "ev_first" (aggressiv):
-           Die Batterie-Ladeleistung wird immer als verfuegbarer Ueberschuss
-           mit eingerechnet. Die Batterie wird nur geladen, wenn das Auto
-           voll ist oder nicht angeschlossen ist.
-           -> Auto hat Vorrang.
-
-        In allen Faellen: Wenn die Batterie unter min_soc faellt, wird
-        die EV-Ladung pausiert um die Batterie zu schuetzen.
+        Rueckgabe (dict):
+          target_ma     -> Soll-Strom in mA (0 = Pause)
+          target_phases -> 1 oder 3 (oder None, falls keine Aenderung noetig)
+          source        -> "pv" | "battery" | "pv+battery" | "none"
+          reason        -> kurze Erlaeuterung fuer Logs
         """
-        # Current wallbox power consumption
         current_wallbox_power = self._keba_data.get("active_power_mw", 0) / 1000.0  # mW -> W
-
-        # Read battery state from Venus OS D-Bus
         battery_soc = self._read_battery_soc()
-        battery_power = self._read_battery_power()  # >0 = charging, <0 = discharging
+        battery_power = self._read_battery_power()  # >0 = laedt, <0 = entlaedt
 
-        # Safety: if battery below minimum SOC, don't charge EV
+        reserve_tod = self._get_battery_reserve_soc()
+
+        # Harter Boden: Batterie-Schutz
         if battery_soc is not None and battery_soc < self.battery_min_soc:
             log.info(f"Batterie SOC {battery_soc:.0f}% < Minimum {self.battery_min_soc}% "
                      f"-> EV-Ladung pausiert (Batterie-Schutz)")
-            return 0
+            # Extend in jedem Fall deaktivieren
+            if self._extend_active:
+                self._extend_active = False
+                self._extend_last_change = time.monotonic()
+            return {"target_ma": 0, "target_phases": None,
+                    "source": "none", "reason": "min_soc"}
 
-        # Base surplus = what goes to grid + what wallbox already uses
+        # Basis-Ueberschuss
         available_w = (-grid_power_w) + current_wallbox_power - self.surplus_buffer_w
 
-        # Apply battery strategy
-        if self.battery_strategy == "battery_above_soc" and battery_soc is not None:
-            if battery_soc >= self.battery_soc_threshold:
-                # Above threshold: battery charging power is also available for EV
+        # Tageszeit-Reserve: nur ueber dieser Schwelle darf die Batterie als
+        # Quelle herhalten (Strategie oder Extend). SOC unbekannt -> defensiv
+        # behandeln wie "ueber Reserve" (Strategie/Extend bleiben dadurch eh
+        # ausgeschaltet, weil sie SOC voraussetzen).
+        over_reserve = battery_soc is None or battery_soc >= reserve_tod
+        added_battery_power = False
+
+        if over_reserve:
+            if self.battery_strategy == "battery_above_soc" and battery_soc is not None:
+                if battery_soc >= self.battery_soc_threshold:
+                    if battery_power is not None and battery_power > 0:
+                        available_w += battery_power
+                        added_battery_power = True
+                        log.debug(f"Batterie SOC {battery_soc:.0f}% >= {self.battery_soc_threshold}%: "
+                                  f"+{battery_power:.0f}W Batterie-Ladeleistung fuer EV")
+                else:
+                    log.debug(f"Batterie SOC {battery_soc:.0f}% < {self.battery_soc_threshold}%: "
+                              f"Batterie hat Vorrang")
+            elif self.battery_strategy == "ev_first":
                 if battery_power is not None and battery_power > 0:
                     available_w += battery_power
-                    log.debug(f"Batterie SOC {battery_soc:.0f}% >= {self.battery_soc_threshold}%: "
-                              f"+{battery_power:.0f}W Batterie-Ladeleistung fuer EV verfuegbar")
+                    added_battery_power = True
+                    log.debug(f"EV-First: +{battery_power:.0f}W Batterie-Ladeleistung umgeleitet")
+            elif self.battery_strategy == "grid_only":
+                log.debug(f"Grid-Only: Nur Netz-Ueberschuss ({-grid_power_w:.0f}W)")
             else:
-                log.debug(f"Batterie SOC {battery_soc:.0f}% < {self.battery_soc_threshold}%: "
-                          f"Batterie hat Vorrang")
-
-        elif self.battery_strategy == "ev_first":
-            # Always count battery charging power as available for EV
-            if battery_power is not None and battery_power > 0:
-                available_w += battery_power
-                log.debug(f"EV-First: +{battery_power:.0f}W Batterie-Ladeleistung umgeleitet")
-
-        elif self.battery_strategy == "grid_only":
-            # Only true grid surplus, battery is managed by ESS independently
-            log.debug(f"Grid-Only: Nur Netz-Ueberschuss ({-grid_power_w:.0f}W)")
-
+                log.warning(f"Unbekannte Batterie-Strategie: {self.battery_strategy}, "
+                            f"verwende grid_only")
         else:
-            log.warning(f"Unbekannte Batterie-Strategie: {self.battery_strategy}, "
-                        f"verwende grid_only")
+            log.debug(f"SOC {battery_soc}% < Reserve_TOD {reserve_tod}% "
+                      f"-> Strategie und Extend aus")
 
-        # Log decision
         if battery_soc is not None:
+            bp_str = f"{battery_power:.0f}W" if battery_power is not None else "?"
             log.debug(f"Ueberschuss-Berechnung: Grid={grid_power_w:.0f}W, "
-                      f"Batterie={battery_power:.0f}W (SOC={battery_soc:.0f}%), "
+                      f"Batterie={bp_str} (SOC={battery_soc:.0f}%, "
+                      f"Reserve_TOD={reserve_tod}%), "
                       f"Wallbox={current_wallbox_power:.0f}W -> "
                       f"Verfuegbar={available_w:.0f}W")
 
-        if available_w <= 0:
-            return 0
+        # Hysterese-Update fuer Batterie-Extend
+        extend_in = self.battery_extend_soc
+        extend_out = self.battery_extend_soc - self.extend_hysteresis_soc
+        if battery_soc is None or not over_reserve:
+            want_extend = False
+        elif self._extend_active:
+            want_extend = battery_soc >= extend_out
+        else:
+            want_extend = battery_soc >= extend_in
 
-        # Get voltage for current calculation
+        now_m = time.monotonic()
+        if want_extend != self._extend_active:
+            if now_m - self._extend_last_change < self.mode_min_hold_s:
+                want_extend = self._extend_active  # Hold-Down respektieren
+            else:
+                self._extend_last_change = now_m
+                log.info(f"Batterie-Extend {'aktiviert' if want_extend else 'deaktiviert'} "
+                         f"(SOC={battery_soc:.0f}% Reserve_TOD={reserve_tod}% "
+                         f"Schwelle_an={extend_in}%/aus={extend_out}%)")
+        self._extend_active = want_extend
+
+        # Spannung fuer Strom-/Leistungs-Umrechnung
         voltage = self._keba_data.get("voltage_l1", 230)
         if voltage == 0:
             voltage = 230  # Fallback
 
-        # Calculate current based on phases
-        phases = self._current_phases
-        target_current_a = available_w / (voltage * phases)
-        target_current_ma = int(target_current_a * 1000)
-
-        # Clamp to valid range (Guide Section 4.1: 6000-32000 mA)
-        hw_max = self._keba_data.get("max_supported_ma", 32000)
-        if target_current_ma < self.min_current_ma:
-            return 0  # Not enough surplus
-        if target_current_ma > min(self._max_current_ma, hw_max):
-            target_current_ma = min(self._max_current_ma, hw_max)
-
-        return target_current_ma
-
-    def _should_switch_phases(self, target_current_ma, grid_power_w):
-        """
-        Determine if a phase switch would be beneficial.
-
-        Strategy:
-        - If on 3 phases and surplus is too low -> switch to 1 phase
-        - If on 1 phase and surplus is high enough for 3 phases -> switch to 3
-
-        Thresholds based on minimum 6A (Guide Section 4.1):
-        - 1-phase minimum: ~1380W (6A * 230V)
-        - 3-phase minimum: ~4140W (6A * 230V * 3)
-        """
-        if not self.phase_switching:
-            return None  # No switch needed
-
-        voltage = self._keba_data.get("voltage_l1", 230)
-        if voltage == 0:
-            voltage = 230
-
-        current_wallbox_power = self._keba_data.get("active_power_mw", 0) / 1000.0
-        available_w = (-grid_power_w) + current_wallbox_power - self.surplus_buffer_w
-
         min_1phase_w = self.min_current_ma / 1000.0 * voltage * 1
         min_3phase_w = self.min_current_ma / 1000.0 * voltage * 3
+        hw_max = self._keba_data.get("max_supported_ma", 32000)
+        upper_ma = min(self._max_current_ma, hw_max)
 
-        if self._current_phases == 3 and available_w < min_3phase_w and available_w >= min_1phase_w:
-            log.info(f"Phasenumschaltung: 3->1 Phase (Ueberschuss {available_w:.0f}W < {min_3phase_w:.0f}W)")
-            return 1
-        elif self._current_phases == 1 and available_w >= min_3phase_w * 1.2:
-            # 1.2x hysteresis to avoid oscillation
-            log.info(f"Phasenumschaltung: 1->3 Phasen (Ueberschuss {available_w:.0f}W >= {min_3phase_w * 1.2:.0f}W)")
-            return 3
+        # Phasen- und Strom-Entscheidung
+        if available_w >= min_3phase_w * 1.2:
+            target_phases = 3
+            target_ma = int(available_w / (voltage * 3) * 1000)
+            target_ma = max(self.min_current_ma, min(target_ma, upper_ma))
+            source = "pv+battery" if added_battery_power else "pv"
+            reason = "pv-3p"
+        elif available_w >= min_1phase_w:
+            target_phases = 1
+            target_ma = int(available_w / voltage * 1000)
+            target_ma = max(self.min_current_ma, min(target_ma, upper_ma))
+            source = "pv+battery" if added_battery_power else "pv"
+            reason = "pv-1p"
+        elif self._extend_active:
+            target_phases = 1
+            target_ma = self.min_current_ma
+            source = "battery"
+            reason = "battery-extend"
+        else:
+            target_phases = None
+            target_ma = 0
+            source = "none"
+            reason = "below-min"
 
-        return None  # No switch
+        return {"target_ma": target_ma, "target_phases": target_phases,
+                "source": source, "reason": reason}
 
     def _trigger_phase_switch(self, target_phases):
         """
@@ -1041,8 +1181,8 @@ class KebaP40Service:
         venus_status = KEBA_TO_VENUS_STATUS.get(keba_state, 0)
 
         # If in PV surplus mode and surplus is too low but car is connected
-        if (self._mode == self.MODE_AUTO and keba_state == 2
-                and self._set_current_ma == 0):
+        if (self.charge_mode == 1 and self._mode == self.MODE_AUTO
+                and keba_state == 2 and self._set_current_ma == 0):
             venus_status = 4  # Waiting for sun
 
         self._dbusservice["/Status"] = venus_status
@@ -1166,8 +1306,11 @@ class KebaP40Service:
             state_names = {0: "Start-up", 1: "Nicht bereit", 2: "Bereit",
                            3: "Laedt", 4: "Fehler", 5: "Unterbrochen"}
             mode_names = {0: "Manuell", 1: "Auto (PV)", 2: "Geplant"}
+            charge_mode_names = {0: "Normal11kW", 1: "PV"}
             log.info(f"Status: Keba={keba_state}({state_names.get(keba_state, '?')}), "
-                     f"Kabel={cable_state}, Modus={mode_names.get(self._mode, '?')}, "
+                     f"Kabel={cable_state}, "
+                     f"ChargeMode={self.charge_mode}({charge_mode_names.get(self.charge_mode, '?')}), "
+                     f"Modus={mode_names.get(self._mode, '?')}, "
                      f"Soll={self._set_current_ma}mA, StartStop={self._start_stop}")
 
             # Determine if we should send current to Keba
@@ -1179,40 +1322,85 @@ class KebaP40Service:
                 log.info(f"Keba State {keba_state} - kein Ladebefehl moeglich")
                 return True
 
-            if self._mode == self.MODE_AUTO:
-                # --- PV Surplus Mode ---
-                grid_power = self._read_grid_power()
-                if grid_power is not None:
-                    # Rolling average over last readings for stability
-                    self._surplus_history.append(grid_power)
-                    if len(self._surplus_history) > 5:
-                        self._surplus_history.pop(0)
-                    avg_grid = sum(self._surplus_history) / len(self._surplus_history)
+            now_m = time.monotonic()
+            hold_ok = (self._phase_last_change == 0.0
+                       or (now_m - self._phase_last_change) >= self.mode_min_hold_s)
 
-                    # Calculate target current from surplus
-                    target_ma = self._calculate_surplus_current(avg_grid)
+            if self.charge_mode == 0:
+                # --- Normal-Modus: 3-phasig, normal_current_ma (~11 kW) ---
+                if self.phase_switching and self._current_phases != 3:
+                    if hold_ok:
+                        if self._trigger_phase_switch(3):
+                            self._phase_last_change = now_m
+                        return True  # Wallbox setzt sich erst nach Umschaltung
+                    else:
+                        log.debug(f"Normal-Modus: Phasenumschaltung 3p blockiert "
+                                  f"(Hold-Down {self.mode_min_hold_s}s noch nicht abgelaufen)")
+                        return True
 
-                    # Check phase switching
-                    new_phases = self._should_switch_phases(target_ma, avg_grid)
-                    if new_phases is not None:
-                        self._trigger_phase_switch(new_phases)
-                        return True  # Wait for next cycle after phase switch
+                hw_max = self._keba_data.get("max_supported_ma", 32000)
+                target_ma = min(self.normal_current_ma, self._max_current_ma, hw_max)
+                target_ma = self._ramp_current(self._set_current_ma, target_ma)
+                self._set_current_ma = target_ma
+                kw = target_ma / 1000.0 * 230.0 * 3.0 / 1000.0
+                log.info(f"Normal-Modus: 3-phasig, Soll={target_ma}mA (~{kw:.1f}kW)")
+                self._write_charging_current(target_ma)
 
-                    # Ramp towards target
-                    target_ma = self._ramp_current(self._set_current_ma, target_ma)
-                    self._set_current_ma = target_ma
-
-                    # Write to Keba (respects 5s write interval internally)
-                    log.info(f"PV-Modus: Grid={avg_grid:.0f}W -> Soll={target_ma}mA")
-                    self._write_charging_current(target_ma)
-                else:
-                    log.warning("Grid-Meter nicht lesbar, kein Ladebefehl")
-
-            elif self._mode == self.MODE_MANUAL:
-                # --- Manual Mode ---
-                # Use the SetCurrent value directly
+            elif self.charge_mode == 1 and self._mode == self.MODE_MANUAL:
+                # --- PV-Modus, aber /Mode=Manuell (Power-User-Hintertuer) ---
                 log.info(f"Manuell: Sende {self._set_current_ma}mA an Keba")
                 self._write_charging_current(self._set_current_ma)
+
+            elif self.charge_mode == 1:
+                # --- PV-Ueberschuss-Modus mit Batterie-Extend ---
+                grid_power = self._read_grid_power()
+                if grid_power is None:
+                    log.warning("Grid-Meter nicht lesbar, kein Ladebefehl")
+                    return True
+
+                self._surplus_history.append(grid_power)
+                if len(self._surplus_history) > 5:
+                    self._surplus_history.pop(0)
+                avg_grid = sum(self._surplus_history) / len(self._surplus_history)
+
+                result = self._calculate_surplus_current(avg_grid)
+                target_ma = result["target_ma"]
+                target_phases = result["target_phases"]
+                source = result["source"]
+                reason = result["reason"]
+
+                battery_soc = self._read_battery_soc()
+                reserve_tod = self._get_battery_reserve_soc()
+                soc_str = f"{battery_soc:.0f}%" if battery_soc is not None else "?"
+                phase_str = f"{target_phases}p" if target_phases else f"{self._current_phases}p"
+                log.info(f"PV-Modus: Grid_avg={avg_grid:.0f}W SOC={soc_str} "
+                         f"Reserve_TOD={reserve_tod}% "
+                         f"Extend={'an' if self._extend_active else 'aus'} "
+                         f"Quelle={source} Phasen={phase_str} "
+                         f"Soll={target_ma}mA ({reason})")
+
+                # Phasenumschaltung (nur wenn wir tatsaechlich laden wollen)
+                if (target_phases is not None
+                        and target_phases != self._current_phases
+                        and self.phase_switching
+                        and target_ma > 0):
+                    if hold_ok:
+                        if self._trigger_phase_switch(target_phases):
+                            self._phase_last_change = now_m
+                        return True
+                    else:
+                        log.debug(f"Phasenumschaltung {self._current_phases}->{target_phases} "
+                                  f"blockiert (Hold-Down)")
+                        # Strom auf 0 lassen, bis Umschaltung erfolgt, um nicht
+                        # auf der falschen Phasenzahl falsch zu rechnen.
+                        target_ma = 0
+
+                target_ma = self._ramp_current(self._set_current_ma, target_ma)
+                self._set_current_ma = target_ma
+                self._write_charging_current(target_ma)
+
+            else:
+                log.warning(f"Unbekannter ChargeMode {self.charge_mode} - ignoriere Zyklus")
 
         except Exception as e:
             log.error(f"Fehler im Update-Zyklus: {e}", exc_info=True)
@@ -1243,6 +1431,16 @@ class KebaP40Service:
         }
         log.info(f"Batterie-Strategie: {strategy_names.get(self.battery_strategy, self.battery_strategy)}")
         log.info(f"Batterie Min-SOC: {self.battery_min_soc}% (EV-Ladung pausiert darunter)")
+        charge_mode_names = {0: "Normal 11kW 3-phasig", 1: "PV-Ueberschuss + Batterie-Extend"}
+        log.info(f"ChargeMode (Start): {self.charge_mode} "
+                 f"({charge_mode_names.get(self.charge_mode, '?')})")
+        log.info(f"Normal-Modus Strom: {self.normal_current_ma} mA pro Phase (~"
+                 f"{self.normal_current_ma/1000.0*230.0*3.0/1000.0:.1f} kW @3p)")
+        log.info(f"Batterie-Extend ab SOC: {self.battery_extend_soc}% "
+                 f"(Hysterese {self.extend_hysteresis_soc}%, Hold-Down {self.mode_min_hold_s}s)")
+        log.info(f"Reserve-Kurve: {self.reserve_schedule_raw}")
+        log.info(f"Reserve-Fallback: {self.reserve_fallback}% "
+                 f"(aktuell laut Tageszeit: {self._get_battery_reserve_soc()}%)")
         if self.dry_run:
             log.warning("=== DRY-RUN: Alle Berechnungen aktiv, aber KEIN Schreiben zur Wallbox ===")
 
