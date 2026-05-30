@@ -1348,7 +1348,22 @@ class KebaP40Service:
 
             elif self.charge_mode == 1 and self._mode == self.MODE_MANUAL:
                 # --- PV-Modus, aber /Mode=Manuell (Power-User-Hintertuer) ---
-                log.info(f"Manuell: Sende {self._set_current_ma}mA an Keba")
+                # Manuell laedt 3-phasig: vor dem Stromsetzen ggf. auf 3 Phasen
+                # umschalten (analog Normal-Modus). Nur wenn wirklich geladen
+                # werden soll (Sollstrom > 0) - beim Pausieren (0 mA) ist die
+                # Phasenzahl egal, dann nicht unnoetig schalten.
+                if (self._set_current_ma > 0
+                        and self.phase_switching
+                        and self._current_phases != 3):
+                    if hold_ok:
+                        if self._trigger_phase_switch(3):
+                            self._phase_last_change = now_m
+                        return True  # Wallbox uebernimmt erst nach der Umschaltung
+                    else:
+                        log.debug(f"Manuell: Phasenumschaltung auf 3p blockiert "
+                                  f"(Hold-Down {self.mode_min_hold_s}s noch nicht abgelaufen)")
+                        return True
+                log.info(f"Manuell: Sende {self._set_current_ma}mA an Keba (3-phasig)")
                 self._write_charging_current(self._set_current_ma)
 
             elif self.charge_mode == 1:
