@@ -29,6 +29,13 @@ timeout = 5.0
 # Muss einzigartig unter allen evcharger-Diensten sein
 device_instance = 40
 
+# Lademodus (/Mode), wird beim Umstellen in der GUI automatisch hier
+# gespeichert und ueberlebt so einen Neustart:
+#   0 = Manuell (Strom per Hand, laedt 3-phasig)
+#   1 = Automatisch (PV-Ueberschuss)
+#   2 = Geplant
+mode = 1
+
 [Charging]
 # --- PV-Ueberschussladung ---
 

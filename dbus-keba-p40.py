@@ -457,7 +457,10 @@ class KebaP40Service:
             log.warning("=== DRY-RUN MODUS AKTIV: Es wird NICHTS zur Wallbox geschrieben! ===")
 
         # Internal state
-        self._mode = self.MODE_AUTO  # Default: PV surplus mode
+        # /Mode wird in config.ini [Venus] mode persistiert -> ueberlebt Neustart
+        self._mode = config.getint("Venus", "mode", fallback=self.MODE_AUTO)
+        if self._mode not in (self.MODE_MANUAL, self.MODE_AUTO, self.MODE_SCHEDULED):
+            self._mode = self.MODE_AUTO
         self._start_stop = 1         # Charging enabled
         self._set_current_ma = 0     # Current target (mA)
         self._max_current_ma = 32000
@@ -542,7 +545,7 @@ class KebaP40Service:
             onchangecallback=self._on_set_current_changed,
         )
         self._dbusservice.add_path(
-            "/Mode", self.MODE_AUTO,
+            "/Mode", self._mode,
             writeable=True,
             onchangecallback=self._on_mode_changed,
         )
@@ -600,11 +603,23 @@ class KebaP40Service:
         return True
 
     def _on_mode_changed(self, path, value):
-        """Handle Mode change from Venus OS."""
-        if value is not None:
-            self._mode = int(value)
-            mode_names = {0: "Manuell", 1: "Automatisch (PV)", 2: "Geplant"}
-            log.info(f"Modus geaendert: {mode_names.get(self._mode, 'Unbekannt')}")
+        """Handle Mode change from Venus OS und persistiere ihn in config.ini."""
+        if value is None:
+            return True
+        try:
+            new_mode = int(value)
+        except (TypeError, ValueError):
+            log.warning(f"Ungueltiger Mode-Wert ignoriert: {value!r}")
+            return False
+        if new_mode not in (self.MODE_MANUAL, self.MODE_AUTO, self.MODE_SCHEDULED):
+            log.warning(f"Ungueltiger Mode {new_mode} (erlaubt: 0, 1, 2) - ignoriert")
+            return False
+        if new_mode == self._mode:
+            return True
+        self._mode = new_mode
+        mode_names = {0: "Manuell", 1: "Automatisch (PV)", 2: "Geplant"}
+        log.info(f"Modus geaendert: {mode_names.get(self._mode, 'Unbekannt')}")
+        self._persist_setting("Venus", "mode", new_mode)
         return True
 
     def _on_start_stop_changed(self, path, value):
@@ -649,12 +664,13 @@ class KebaP40Service:
         self._phase_last_change = 0.0
         mode_names = {0: "Normal 11kW 3-phasig", 1: "PV-Ueberschuss"}
         log.info(f"ChargeMode geaendert: {mode_names[old_mode]} -> {mode_names[new_mode]}")
-        self._persist_charge_mode(new_mode)
+        self._persist_setting("ChargeMode", "default", new_mode)
         return True
 
-    def _persist_charge_mode(self, value):
+    def _persist_setting(self, section, key, value):
         """
-        Speichert den ChargeMode in config.ini, damit er einen Neustart ueberlebt.
+        Speichert eine einzelne Einstellung dauerhaft in config.ini, damit sie
+        einen Neustart ueberlebt (z.B. ChargeMode oder Mode).
 
         Hinweis: configparser.write() verliert Kommentare in der Datei. Die
         kommentierte Vorlage lebt in config.ini.example.
@@ -666,16 +682,16 @@ class KebaP40Service:
             cp = configparser.ConfigParser()
             cp.optionxform = str  # Keys nicht in lowercase wandeln
             cp.read(config_path)
-            if not cp.has_section("ChargeMode"):
-                cp.add_section("ChargeMode")
-            cp.set("ChargeMode", "default", str(value))
+            if not cp.has_section(section):
+                cp.add_section(section)
+            cp.set(section, key, str(value))
             tmp_path = config_path + ".tmp"
             with open(tmp_path, "w") as f:
                 cp.write(f)
             os.replace(tmp_path, config_path)
-            log.info(f"ChargeMode={value} in config.ini gespeichert")
+            log.info(f"[{section}] {key}={value} in config.ini gespeichert")
         except Exception as e:
-            log.warning(f"Konnte ChargeMode nicht persistieren: {e}")
+            log.warning(f"Konnte [{section}] {key} nicht persistieren: {e}")
 
     # --- Venus OS D-Bus Readings (Grid, Battery, PV) ---
 
