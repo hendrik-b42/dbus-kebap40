@@ -36,6 +36,14 @@ device_instance = 40
 #   2 = Geplant
 mode = 1
 
+# Position der Wallbox in der Anlage (/Position). MUSS zur tatsaechlichen
+# Verkabelung passen, sonst zaehlt Venus die Ladeleistung doppelt (faellt
+# v.a. bei 1-phasigem Laden auf):
+#   0 = AC-Eingang / Netzseite (netzparallel, keine Critical-Loads-Ausgang)
+#   1 = AC-Ausgang / hinter dem Wechselrichter (Critical Loads)
+# Faustregel: ist /Ac/ConsumptionOnOutput im System leer -> 0.
+position = 0
+
 [Charging]
 # --- PV-Ueberschussladung ---
 

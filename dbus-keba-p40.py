@@ -464,7 +464,12 @@ class KebaP40Service:
         self._start_stop = 1         # Charging enabled
         self._set_current_ma = 0     # Current target (mA)
         self._max_current_ma = 32000
-        self._position = 1           # 1 = AC Output (after inverter)
+        # /Position: 0 = AC-Eingang (Netzseite), 1 = AC-Ausgang (hinter
+        # Wechselrichter). Muss zur tatsaechlichen Verkabelung passen, sonst
+        # zaehlt Venus die Wallbox-Leistung doppelt (v.a. bei 1-phasigem Laden).
+        self._position = config.getint("Venus", "position", fallback=0)
+        if self._position not in (0, 1):
+            self._position = 0
         self._current_phases = 3     # Current phase count (1 or 3)
         self._charging_start_time = 0
         self._charging_total_seconds = 0  # Cumulative charge time across pauses in same session
