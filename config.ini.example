@@ -36,6 +36,15 @@ device_instance = 40
 #   2 = Geplant
 mode = 1
 
+# Ladestrom im Manuell-Modus in A (/SetCurrent), wird beim Setzen in der
+# GUI automatisch hier gespeichert. Ein Treiber-Neustart setzt eine laufende
+# manuelle Ladung damit fort, statt sie mit 0 A abzubrechen. 0 = Pause.
+set_current_a = 0
+
+# Laden ein/aus (/StartStop), wird ebenfalls automatisch gespeichert, damit
+# eine pausierte Ladung nach einem Neustart pausiert bleibt. 1 = Ein, 0 = Aus.
+start_stop = 1
+
 # Position der Wallbox in der Anlage (/Position). MUSS zur tatsaechlichen
 # Verkabelung passen, sonst zaehlt Venus die Ladeleistung doppelt (faellt
 # v.a. bei 1-phasigem Laden auf):

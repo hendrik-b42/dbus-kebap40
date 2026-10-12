@@ -317,26 +317,37 @@ class KebaModbusTCP:
                 self.disconnect()
                 return None
 
-    def write_register(self, register, value):
+    def write_ready(self):
+        """True, wenn der Mindestabstand von 5s seit dem letzten Write um ist."""
+        return time.monotonic() - self._last_write_time >= KEBA_WRITE_INTERVAL_S
+
+    def write_register(self, register, value, wait=False):
         """
         Write a UINT16 value to a single register on the Keba P40.
 
         Per Guide p.8: FC6 (Write Single Register).
         Write interval minimum: 5 seconds (Guide p.8).
 
-        Returns True on success, False on error.
+        Default (wait=False): ist der 5s-Abstand noch nicht um, wird NICHT
+        geschrieben und None zurueckgegeben - der Aufrufer versucht es im
+        naechsten Zyklus erneut. So blockiert der GLib-Loop nie und D-Bus
+        bleibt ansprechbar. wait=True schlaeft stattdessen (nur vor dem
+        MainLoop verwenden).
+
+        Returns True on success, False on error, None if deferred.
         """
         with self._lock:
             if not self._socket:
                 return False
 
             # Enforce minimum write interval of 5s (Guide p.8)
-            now = time.monotonic()
-            elapsed = now - self._last_write_time
+            elapsed = time.monotonic() - self._last_write_time
             if elapsed < KEBA_WRITE_INTERVAL_S:
-                wait = KEBA_WRITE_INTERVAL_S - elapsed
-                log.debug(f"Warte {wait:.1f}s vor naechstem Schreibbefehl (min. 5s lt. Handbuch)")
-                time.sleep(wait)
+                if not wait:
+                    return None
+                remaining = KEBA_WRITE_INTERVAL_S - elapsed
+                log.debug(f"Warte {remaining:.1f}s vor naechstem Schreibbefehl (min. 5s lt. Handbuch)")
+                time.sleep(remaining)
 
             try:
                 tid = self._next_transaction_id()
@@ -356,8 +367,9 @@ class KebaModbusTCP:
 
                 self._socket.sendall(request)
 
-                # Read response (echo of request for FC6)
-                response = self._recv_exact(12)
+                # Read response: echo of request (12 bytes) for FC6, or a
+                # 9-byte exception response (FC | 0x80 + exception code)
+                response = self._recv_exact(9)
                 if response is None:
                     return False
 
@@ -366,8 +378,12 @@ class KebaModbusTCP:
 
                 self._last_write_time = time.monotonic()
 
-                if resp_fc != KEBA_FC_WRITE:
-                    log.warning(f"Schreibfehler Register {register}: FC={resp_fc:#x}")
+                if resp_fc == KEBA_FC_WRITE:
+                    if self._recv_exact(3) is None:
+                        return False
+                else:
+                    log.warning(f"Schreibfehler Register {register}: FC={resp_fc:#x}, "
+                                f"Exception-Code={response[8]}")
                     return False
 
                 log.debug(f"Register {register} = {value} geschrieben")
@@ -461,9 +477,18 @@ class KebaP40Service:
         self._mode = config.getint("Venus", "mode", fallback=self.MODE_AUTO)
         if self._mode not in (self.MODE_MANUAL, self.MODE_AUTO, self.MODE_SCHEDULED):
             self._mode = self.MODE_AUTO
-        self._start_stop = 1         # Charging enabled
-        self._set_current_ma = 0     # Current target (mA)
+        # /StartStop wird ebenfalls persistiert: sonst wuerde ein Neustart eine
+        # per StartStop pausierte Ladung mit dem gespeicherten Strom fortsetzen
+        self._start_stop = 1 if config.getint("Venus", "start_stop", fallback=1) else 0
         self._max_current_ma = 32000
+        # Current target (mA). Im Manuell-Modus wird der per GUI gesetzte
+        # Strom in config.ini [Venus] set_current_a persistiert, damit ein
+        # Treiber-Neustart eine laufende Ladung nicht mit 0 mA abbricht.
+        # In Auto/PV startet die Rampe bewusst bei 0.
+        self._set_current_ma = 0
+        if self._mode == self.MODE_MANUAL:
+            saved_a = config.getint("Venus", "set_current_a", fallback=0)
+            self._set_current_ma = max(0, min(saved_a * 1000, self._max_current_ma))
         # /Position: 0 = AC-Eingang (Netzseite), 1 = AC-Ausgang (hinter
         # Wechselrichter). Muss zur tatsaechlichen Verkabelung passen, sonst
         # zaehlt Venus die Wallbox-Leistung doppelt (v.a. bei 1-phasigem Laden).
@@ -473,7 +498,21 @@ class KebaP40Service:
         self._current_phases = 3     # Current phase count (1 or 3)
         self._charging_start_time = 0
         self._charging_total_seconds = 0  # Cumulative charge time across pauses in same session
-        self._last_current_write = 0
+        # Letzter erfolgreich geschriebener 5004-Wert (None = unbekannt, z.B.
+        # nach Start oder Wallbox-Neustart -> naechster Wert wird geschrieben)
+        self._last_current_write = None
+        self._last_current_write_time = 0.0
+        # Unveraenderte Werte nur als Heartbeat wiederholen - deutlich unter
+        # dem Failsafe-Timeout, damit die Wallbox nicht in den Failsafe faellt
+        if self.failsafe_timeout_s > 0:
+            self._write_heartbeat_s = max(KEBA_WRITE_INTERVAL_S, self.failsafe_timeout_s / 2.0)
+        else:
+            self._write_heartbeat_s = 60.0
+        # Konfigurations-Writes (Failsafe, Phasenquelle), die der Update-Loop
+        # nicht-blockierend abarbeitet: Liste von (register, value, label)
+        self._pending_config_writes = []
+        self._last_status_key = None
+        self._last_status_log = 0.0
         self._surplus_history = []   # Rolling average of surplus
         # Batterie-Extend (PV-Modus) und Phasen-Hold-Down
         self._extend_active = False
@@ -544,7 +583,7 @@ class KebaP40Service:
             onchangecallback=self._on_max_current_changed,
         )
         self._dbusservice.add_path(
-            "/SetCurrent", 0,
+            "/SetCurrent", self._set_current_ma // 1000,
             gettextcallback=lambda p, v: f"{v:.0f}A",
             writeable=True,
             onchangecallback=self._on_set_current_changed,
@@ -555,7 +594,7 @@ class KebaP40Service:
             onchangecallback=self._on_mode_changed,
         )
         self._dbusservice.add_path(
-            "/StartStop", 1,
+            "/StartStop", self._start_stop,
             writeable=True,
             onchangecallback=self._on_start_stop_changed,
         )
@@ -605,6 +644,7 @@ class KebaP40Service:
             target_ma = int(value) * 1000
             self._set_current_ma = max(0, min(target_ma, self._max_current_ma))
             log.info(f"SetCurrent geaendert (manuell): {value}A")
+            self._persist_setting("Venus", "set_current_a", self._set_current_ma // 1000)
         return True
 
     def _on_mode_changed(self, path, value):
@@ -630,10 +670,16 @@ class KebaP40Service:
     def _on_start_stop_changed(self, path, value):
         """Handle StartStop change from Venus OS."""
         if value is not None:
-            self._start_stop = int(value)
+            new_value = 1 if int(value) else 0
+            if new_value == self._start_stop:
+                return True
+            self._start_stop = new_value
             log.info(f"StartStop geaendert: {'Ein' if self._start_stop else 'Aus'}")
+            self._persist_setting("Venus", "start_stop", self._start_stop)
             if not self._start_stop:
-                # Immediately suspend charging (Register 5004 = 0, Guide p.20)
+                # Suspend charging (Register 5004 = 0, Guide p.20). Ist der
+                # 5s-Schreibabstand noch nicht um, holt der Update-Loop den
+                # Write im naechsten Zyklus nach - nie im D-Bus-Callback warten.
                 self._write_charging_current(0)
         return True
 
@@ -815,6 +861,9 @@ class KebaP40Service:
                 if name in ("charging_state",):
                     log.error(f"Kritisches Register {name} ({reg}) nicht lesbar")
                     return False
+                # Verbindung mitten im Zyklus verloren: keine halben Daten publizieren
+                if not self.modbus.is_connected():
+                    return False
 
         self._keba_data = data
         return True
@@ -838,70 +887,96 @@ class KebaP40Service:
         if current_ma > 32000:
             current_ma = 32000
 
+        # Unveraenderten Wert nicht alle 5s neu senden, nur als Heartbeat
+        now = time.monotonic()
+        if (current_ma == self._last_current_write
+                and now - self._last_current_write_time < self._write_heartbeat_s):
+            return True
+
         if self.dry_run:
             log.info(f"[DRY-RUN] Wuerde Ladestrom setzen: {current_ma} mA "
                      f"(Register 5004) - NICHT geschrieben")
             self._last_current_write = current_ma
+            self._last_current_write_time = now
             return True
 
         success = self.modbus.write_register(REG_SET_CURRENT, int(current_ma))
+        if success is None:
+            # 5s-Schreibabstand noch nicht um -> naechster Zyklus
+            return False
         if success:
+            if current_ma != self._last_current_write:
+                log.info(f">>> Register 5004 = {current_ma} mA geschrieben")
+            else:
+                log.debug(f">>> Register 5004 = {current_ma} mA (Heartbeat)")
             self._last_current_write = current_ma
-            log.info(f">>> Register 5004 = {current_ma} mA geschrieben")
+            self._last_current_write_time = time.monotonic()
         else:
             log.error(f">>> Register 5004 Schreibfehler! Sollwert war {current_ma} mA")
         return success
 
-    def _setup_failsafe(self):
+    def _queue_config_writes(self):
         """
-        Configure EMS Failsafe on the Keba P40.
+        Stellt die Wallbox-Konfiguration in die Write-Queue: EMS Failsafe
+        (Guide Section 4.7) und Phasenumschaltung via Modbus (Section 4.5).
 
-        Per Guide Section 4.7 (p.22-23):
+        Wird beim Start und nach jedem Verbindungsverlust (z.B. Wallbox-
+        Neustart) aufgerufen. Abgearbeitet wird nicht-blockierend in
+        _process_config_writes(), ein Write pro Zyklus im 5s-Abstand.
+
         - Register 5018: Failsafe Timeout (0=deactivate, 5-600s)
         - Register 5016: Failsafe Current (0=suspend, 6000-32000 mA)
-
-        If the Modbus TCP connection is lost for longer than the timeout,
-        the Keba falls back to the failsafe current.
+        - Register 5050: 3 = Phasenumschaltung via Modbus TCP
         """
-        if self.dry_run:
-            log.info(f"[DRY-RUN] Wuerde EMS Failsafe konfigurieren: "
-                     f"Timeout={self.failsafe_timeout_s}s, Strom={self.failsafe_current_ma}mA")
-            return
-
+        writes = []
         if self.failsafe_timeout_s > 0:
             log.info(f"Konfiguriere EMS Failsafe: Timeout={self.failsafe_timeout_s}s, "
-                      f"Strom={self.failsafe_current_ma}mA")
-            self.modbus.write_register(REG_FAILSAFE_TIMEOUT, self.failsafe_timeout_s)
-            time.sleep(KEBA_WRITE_INTERVAL_S)
-            self.modbus.write_register(REG_FAILSAFE_CURRENT, self.failsafe_current_ma)
+                     f"Strom={self.failsafe_current_ma}mA")
+            writes.append((REG_FAILSAFE_TIMEOUT, self.failsafe_timeout_s, "Failsafe Timeout"))
+            writes.append((REG_FAILSAFE_CURRENT, self.failsafe_current_ma, "Failsafe Strom"))
         else:
             log.info("EMS Failsafe deaktiviert")
-            self.modbus.write_register(REG_FAILSAFE_TIMEOUT, 0)
+            writes.append((REG_FAILSAFE_TIMEOUT, 0, "Failsafe Timeout"))
 
-    def _setup_phase_switching(self):
-        """
-        Enable phase switching via Modbus TCP if supported.
-
-        Register 5050 (Guide Section 4.5, p.21):
-        Value 3 = Phase switching via Modbus TCP
-
-        NOTE: This register requires a future software update per Guide!
-        The driver attempts to set it but handles failure gracefully.
-        """
-        if not self.phase_switching:
-            return
+        if self.phase_switching:
+            log.info("Aktiviere Phasenumschaltung via Modbus TCP (Register 5050=3)")
+            writes.append((REG_SET_PHASE_SOURCE, 3, "Phasenquelle Modbus"))
 
         if self.dry_run:
-            log.info("[DRY-RUN] Wuerde Phasenumschaltung via Modbus TCP aktivieren (Register 5050=3)")
+            for reg, value, label in writes:
+                log.info(f"[DRY-RUN] Wuerde {label} schreiben: Register {reg}={value}")
             return
+        self._pending_config_writes = writes
 
-        log.info("Versuche Phasenumschaltung via Modbus TCP zu aktivieren (Register 5050=3)")
-        success = self.modbus.write_register(REG_SET_PHASE_SOURCE, 3)
-        if not success:
-            log.warning("Phasenumschaltung via Modbus TCP nicht verfuegbar. "
-                        "Moeglicherweise ist ein Firmware-Update erforderlich "
-                        "(siehe Guide Section 4.5, Hinweis).")
-            self.phase_switching = False
+    def _process_config_writes(self):
+        """
+        Arbeitet hoechstens einen Konfigurations-Write ab. Liefert True,
+        solange noch Writes ausstehen (dann wird in diesem Zyklus kein
+        Ladestrom geschrieben, Konfiguration hat Vorrang).
+        """
+        if not self._pending_config_writes:
+            return False
+        if not self.modbus.write_ready():
+            return True
+
+        reg, value, label = self._pending_config_writes[0]
+        success = self.modbus.write_register(reg, value)
+        if success is None:
+            return True
+        if success:
+            log.info(f">>> Register {reg} = {value} geschrieben ({label})")
+            self._pending_config_writes.pop(0)
+        elif self.modbus.is_connected():
+            # Wallbox hat mit Modbus-Exception geantwortet -> nicht endlos wiederholen
+            log.warning(f"{label} (Register {reg}={value}) von der Wallbox abgelehnt")
+            self._pending_config_writes.pop(0)
+            if reg == REG_SET_PHASE_SOURCE:
+                log.warning("Phasenumschaltung via Modbus TCP nicht verfuegbar. "
+                            "Moeglicherweise ist ein Firmware-Update erforderlich "
+                            "(siehe Guide Section 4.5, Hinweis).")
+                self.phase_switching = False
+        # Verbindungsfehler: Eintrag bleibt in der Queue, Reconnect im naechsten Zyklus
+        return bool(self._pending_config_writes)
 
     # --- PV Surplus Charging Logic ---
 
@@ -1117,6 +1192,8 @@ class KebaP40Service:
                      f"ausloesen (Register 5052={value})")
             return True
 
+        if not self.modbus.write_ready():
+            return False  # 5s-Schreibabstand, naechster Zyklus
         log.info(f"Phasenumschaltung auf {target_phases} Phase(n)...")
         success = self.modbus.write_register(REG_TRIGGER_PHASE_SWITCH, value)
         if success:
@@ -1282,6 +1359,32 @@ class KebaP40Service:
 
     # --- Main Update Loop ---
 
+    def _log_status(self, keba_state):
+        """
+        Status-Zeile auf INFO: bei jeder Aenderung sofort, sonst einmal pro
+        Minute. Haelt das Log lesbar und verhindert, dass multilog die
+        Historie innerhalb weniger Stunden wegrotiert.
+        """
+        cable_state = self._keba_data.get("cable_state", 0)
+        key = (keba_state, cable_state, self.charge_mode, self._mode,
+               self._set_current_ma, self._start_stop)
+        now = time.monotonic()
+        if key == self._last_status_key and now - self._last_status_log < 60:
+            return
+        self._last_status_key = key
+        self._last_status_log = now
+        state_names = {0: "Start-up", 1: "Nicht bereit", 2: "Bereit",
+                       3: "Laedt", 4: "Fehler", 5: "Unterbrochen"}
+        mode_names = {0: "Manuell", 1: "Auto (PV)", 2: "Geplant"}
+        charge_mode_names = {0: "Normal11kW", 1: "PV"}
+        power_w = self._keba_data.get("active_power_mw", 0) / 1000.0
+        log.info(f"Status: Keba={keba_state}({state_names.get(keba_state, '?')}), "
+                 f"Kabel={cable_state}, "
+                 f"ChargeMode={self.charge_mode}({charge_mode_names.get(self.charge_mode, '?')}), "
+                 f"Modus={mode_names.get(self._mode, '?')}, "
+                 f"Soll={self._set_current_ma}mA, StartStop={self._start_stop}, "
+                 f"Leistung={power_w:.0f}W")
+
     def _update(self):
         """
         Main update cycle, called by GLib.timeout_add.
@@ -1294,18 +1397,27 @@ class KebaP40Service:
         Returns True to keep the timer running (GLib convention).
         """
         try:
-            # Step 1: Read Keba data
+            # Step 1: Read Keba data (_read_keba_data verbindet bei Bedarf neu)
+            was_connected = self.modbus.is_connected()
             if not self._read_keba_data():
                 self._dbusservice["/Connected"] = 0
-                # Try to reconnect
                 self.modbus.disconnect()
-                time.sleep(1)
-                if self.modbus.connect():
-                    self._dbusservice["/Connected"] = 1
-                return True  # Keep timer running
+                return True  # Keep timer running, reconnect next cycle
+
+            if not was_connected:
+                # Neu verbunden (z.B. nach Wallbox-Neustart/FW-Update): die
+                # Wallbox kann ihre Einstellungen verloren haben -> Konfiguration
+                # erneut schreiben und den Ladestrom-Sollwert neu senden.
+                log.info("Verbindung zur Keba wiederhergestellt - schreibe Konfiguration neu")
+                self._queue_config_writes()
+                self._last_current_write = None
 
             # Step 2: Update D-Bus
             self._update_dbus()
+
+            # Ausstehende Konfigurations-Writes haben Vorrang vor dem Ladestrom
+            if self._process_config_writes():
+                return True
 
             # Step 3: Charging logic
             keba_state = self._keba_data.get("charging_state", 0)
@@ -1316,23 +1428,14 @@ class KebaP40Service:
                 log.debug("Fast Charging aktiv - Strom nicht steuerbar")
                 return True
 
+            self._log_status(keba_state)
+
             # If charging is disabled via StartStop
             if not self._start_stop:
-                if self._last_current_write != 0:
-                    self._write_charging_current(0)
+                # 0 mA halten (inkl. Heartbeat, gedrosselt in _write_charging_current)
+                self._write_charging_current(0)
                 return True
 
-            # Log state on every cycle at INFO level for diagnostics
-            cable_state = self._keba_data.get("cable_state", 0)
-            state_names = {0: "Start-up", 1: "Nicht bereit", 2: "Bereit",
-                           3: "Laedt", 4: "Fehler", 5: "Unterbrochen"}
-            mode_names = {0: "Manuell", 1: "Auto (PV)", 2: "Geplant"}
-            charge_mode_names = {0: "Normal11kW", 1: "PV"}
-            log.info(f"Status: Keba={keba_state}({state_names.get(keba_state, '?')}), "
-                     f"Kabel={cable_state}, "
-                     f"ChargeMode={self.charge_mode}({charge_mode_names.get(self.charge_mode, '?')}), "
-                     f"Modus={mode_names.get(self._mode, '?')}, "
-                     f"Soll={self._set_current_ma}mA, StartStop={self._start_stop}")
 
             # Determine if we should send current to Keba
             # State 2 = ready (waiting for EV), State 3 = charging
@@ -1364,7 +1467,7 @@ class KebaP40Service:
                 target_ma = self._ramp_current(self._set_current_ma, target_ma)
                 self._set_current_ma = target_ma
                 kw = target_ma / 1000.0 * 230.0 * 3.0 / 1000.0
-                log.info(f"Normal-Modus: 3-phasig, Soll={target_ma}mA (~{kw:.1f}kW)")
+                log.debug(f"Normal-Modus: 3-phasig, Soll={target_ma}mA (~{kw:.1f}kW)")
                 self._write_charging_current(target_ma)
 
             elif self.charge_mode == 1 and self._mode == self.MODE_MANUAL:
@@ -1384,7 +1487,7 @@ class KebaP40Service:
                         log.debug(f"Manuell: Phasenumschaltung auf 3p blockiert "
                                   f"(Hold-Down {self.mode_min_hold_s}s noch nicht abgelaufen)")
                         return True
-                log.info(f"Manuell: Sende {self._set_current_ma}mA an Keba (3-phasig)")
+                log.debug(f"Manuell: Sende {self._set_current_ma}mA an Keba (3-phasig)")
                 self._write_charging_current(self._set_current_ma)
 
             elif self.charge_mode == 1:
@@ -1451,9 +1554,8 @@ class KebaP40Service:
 
         1. Connect to Keba via Modbus TCP
         2. Read product info
-        3. Configure failsafe
-        4. Setup phase switching
-        5. Start periodic update loop
+        3. Queue failsafe + phase switching config (written by update loop)
+        4. Start periodic update loop
         """
         log.info("=== KEBA P40 Venus OS Treiber startet ===")
         log.info(f"Keba Host: {self.keba_host}:{self.keba_port}")
@@ -1493,16 +1595,14 @@ class KebaP40Service:
         # Read product info once
         self._read_product_info()
 
-        # Configure failsafe (Guide Section 4.7)
-        time.sleep(KEBA_WRITE_INTERVAL_S)
-        self._setup_failsafe()
-
-        # Setup phase switching (Guide Section 4.5)
-        time.sleep(KEBA_WRITE_INTERVAL_S)
-        self._setup_phase_switching()
+        # Failsafe (Guide Section 4.7) und Phasenumschaltung (Section 4.5)
+        # werden vom Update-Loop nicht-blockierend geschrieben
+        self._queue_config_writes()
+        if self._mode == self.MODE_MANUAL and self._set_current_ma > 0:
+            log.info(f"Manuell: gespeicherter Ladestrom {self._set_current_ma // 1000}A wiederhergestellt")
 
         # Start update loop (every 2 seconds)
-        update_interval_ms = int(config.getfloat("Charging", "update_interval_s", fallback=2.0) * 1000)
+        update_interval_ms = int(self.config.getfloat("Charging", "update_interval_s", fallback=2.0) * 1000)
         GLib.timeout_add(update_interval_ms, self._update)
 
         log.info("Treiber gestartet. Warte auf Daten...")
