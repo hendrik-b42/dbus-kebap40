@@ -295,6 +295,9 @@ class KebaModbusTCP:
                 resp_tid, resp_proto, resp_len, resp_unit, resp_fc, byte_count = \
                     struct.unpack(">HHHBBB", response)
 
+                if not self._check_tid(tid, resp_tid, register):
+                    return None
+
                 if resp_fc != KEBA_FC_READ:
                     # Error response
                     log.warning(f"Modbus Fehler bei Register {register}: FC={resp_fc:#x}")
@@ -378,6 +381,9 @@ class KebaModbusTCP:
 
                 self._last_write_time = time.monotonic()
 
+                if not self._check_tid(tid, resp_tid, register):
+                    return False
+
                 if resp_fc == KEBA_FC_WRITE:
                     if self._recv_exact(3) is None:
                         return False
@@ -393,6 +399,19 @@ class KebaModbusTCP:
                 log.error(f"Schreibfehler Register {register}: {e}")
                 self.disconnect()
                 return False
+
+    def _check_tid(self, tid, resp_tid, register):
+        """
+        Antwort muss zur Anfrage gehoeren. Eine verspaetete oder doppelte
+        Antwort wuerde sonst einem falschen Register zugeordnet und der Stream
+        bliebe verschoben -> Verbindung verwerfen, naechster Zyklus verbindet neu.
+        """
+        if resp_tid == tid:
+            return True
+        log.warning(f"Modbus Antwort passt nicht zur Anfrage (Register {register}: "
+                    f"Transaction-ID {resp_tid} statt {tid}) - verbinde neu")
+        self.disconnect()
+        return False
 
     def _recv_exact(self, count):
         """Receive exactly count bytes from socket."""
@@ -1260,6 +1279,16 @@ class KebaP40Service:
         self._dbusservice["/Ac/L1/Power"] = round(v1 * i1, 1) if v1 and i1 else 0
         self._dbusservice["/Ac/L2/Power"] = round(v2 * i2, 1) if v2 and i2 else 0
         self._dbusservice["/Ac/L3/Power"] = round(v3 * i3, 1) if v3 and i3 else 0
+
+        # Plausibilitaet: Register 1020 vs. Summe U*I (cos phi ~1 beim Laden).
+        # Nur Diagnose - geloggt mit Rohwerten, damit Ausreisser belegbar sind.
+        phase_sum_w = v1 * i1 + v2 * i2 + v3 * i3
+        if (d.get("charging_state") == 3 and phase_sum_w > 1000
+                and abs(power_w - phase_sum_w) > 0.3 * phase_sum_w):
+            log.warning(f"Leistung unplausibel: Register 1020={power_w:.0f}W, "
+                        f"Summe U*I={phase_sum_w:.0f}W "
+                        f"(U={v1}/{v2}/{v3}V, I={i1:.2f}/{i2:.2f}/{i3:.2f}A, "
+                        f"cos phi={d.get('power_factor', '?')})")
 
         # Energy values (Keba unit: 0.1 Wh -> kWh)
         # Known bug: FW < 1.2.1 reports in Wh instead of 0.1 Wh (Guide p.24)
